@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pare-worker-kit"
+version = "0.1.0"
+description = "The server half of a PARE worker: risk-tier metadata and transport serving."
+readme = "README.md"
+requires-python = ">=3.10"
+# ONE dependency, deliberately. This package exists so that a worker on a
+# Raspberry Pi does not install agent_core to obtain a constant -- which
+# would drag in trafilatura, markitdown[pdf,docx,pptx,xlsx], rich and
+# prompt-toolkit for a forty-line wrapper. Adding a dependency here
+# re-creates the problem; think hard before you do.
+dependencies = [
+    "mcp>=1.27.0,<2",   # 2.0 renamed streamablehttp_client; agent_core targets 1.x
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pare_worker_kit"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
