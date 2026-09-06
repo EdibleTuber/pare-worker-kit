@@ -1,5 +1,6 @@
 """run_worker's job is to refuse bad launches before anything binds."""
 import ipaddress
+import re
 import socket
 
 import pytest
@@ -59,9 +60,34 @@ def _kernel_binds_as_wildcard(spelling: str) -> str | None:
     return None
 
 
+def refuses(server, env, match):
+    """run_worker rejects this launch: exit 2, message on stderr, nothing bound.
+
+    Asserts what an OPERATOR sees, not which exception class was raised
+    internally. The distinction earned itself: two config mistakes reached a
+    journal as full Python tracebacks with the actionable sentence last and
+    line-wrapped, which is how "add one line to the unit" reads as a crash.
+    """
+    import contextlib
+    import io
+
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        with pytest.raises(SystemExit) as excinfo:
+            run_worker(server, env=env)
+    assert excinfo.value.code == 2, (
+        "config refusals exit 2 so systemctl status distinguishes them from a "
+        "runtime failure")
+    text = err.getvalue()
+    assert re.search(match, text), f"stderr was {text!r}, wanted {match!r}"
+    assert "Traceback" not in text, "a configuration error is not a crash"
+    return text
+
+
 @pytest.mark.parametrize("spelling", ["0.0.0.0", "0", "0x0", "00.0.0.0", "0000",
                                       "0.0.0.0.", "::", "::0",
                                       "0:0:0:0:0:0:0:0"])
+
 def test_no_spelling_of_the_wildcard_gets_through(spelling):
     """The bind address is the only access control this worker has, so the
     question is not 'does it reject the string 0.0.0.0' but 'can anything an
@@ -154,23 +180,22 @@ def test_both_spellings_of_the_http_transport_are_accepted(spelling):
 
 
 def test_an_unknown_transport_names_the_valid_ones():
-    with pytest.raises(WorkerServeError, match="unknown transport"):
-        run_worker(_BundledServer(), env={"AGENT_WORKER_TRANSPORT": "sse"})
+    refuses(_BundledServer(), {"AGENT_WORKER_TRANSPORT": "sse"},
+            "unknown transport")
 
 
 def test_http_without_a_port_is_refused_here_not_inside_uvicorn():
     """There is no default port on purpose: two workers on one laptop would
     both take it and the second would die with a socket error rather than a
     configuration one."""
-    with pytest.raises(WorkerServeError, match="required when serving over http"):
-        run_worker(_BundledServer(), env={"AGENT_WORKER_TRANSPORT": "http"})
+    refuses(_BundledServer(), {"AGENT_WORKER_TRANSPORT": "http"},
+            "required when serving over http")
 
 
 @pytest.mark.parametrize("bad", ["nine", "0", "65536", "-1"])
 def test_an_unusable_port_is_refused(bad):
-    with pytest.raises(WorkerServeError):
-        run_worker(_BundledServer(), env={"AGENT_WORKER_TRANSPORT": "http",
-                                          "AGENT_WORKER_PORT": bad})
+    refuses(_BundledServer(), {"AGENT_WORKER_TRANSPORT": "http",
+                               "AGENT_WORKER_PORT": bad}, r"\S")
 
 
 def test_http_defaults_to_loopback_when_no_host_is_given():
@@ -211,10 +236,9 @@ def test_stateless_http_is_refused():
     """Session ids are currently the only thing that surfaces a worker
     restart to the daemon. Without one, a scope: session approval can
     survive onto a different process."""
-    server = _BundledServer(stateless_http=True)
-    with pytest.raises(WorkerServeError, match="session"):
-        run_worker(server, env={"AGENT_WORKER_TRANSPORT": "http",
-                                "AGENT_WORKER_PORT": "9101"})
+    refuses(_BundledServer(stateless_http=True),
+            {"AGENT_WORKER_TRANSPORT": "http", "AGENT_WORKER_PORT": "9101"},
+            "session")
 
 
 def test_dns_rebinding_protection_is_turned_on():

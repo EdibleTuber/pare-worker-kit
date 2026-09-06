@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pare-worker-kit"
-version = "0.1.1"
+version = "0.1.2"
 description = "The server half of a PARE worker: risk-tier metadata and transport serving."
 readme = "README.md"
 requires-python = ">=3.10"
