@@ -9,4 +9,4 @@ from pare_worker_kit.serve import (WorkerServeError, resolve_bind_address,
 
 __all__ = ["RISK_TIER_META_KEY", "VALID_RISK_TIERS", "run_worker",
            "resolve_bind_address", "stamp_version", "WorkerServeError"]
-__version__ = "0.1.0"
+__version__ = "0.1.1"
