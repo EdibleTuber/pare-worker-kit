@@ -4,7 +4,7 @@ import socket
 
 import pytest
 
-from pare_worker_kit import (RISK_TIER_META_KEY, WorkerServeError,
+from pare_worker_kit import (RISK_TIER_META_KEY, WorkerServeError, stamp_version,
                              resolve_bind_address, run_worker)
 
 
@@ -251,3 +251,66 @@ def test_the_meta_key_agrees_with_agent_cores():
         reason="agent_core is not installed here; the daemon-side half of "
                "this check runs in agent_core's own suite")
     assert agent_core_risk.RISK_TIER_META_KEY == RISK_TIER_META_KEY
+
+
+# --- serverInfo.version is provenance, and its default is misleading ------
+
+class _LowServer:
+    def __init__(self, name):
+        self.name = name
+        self.version = None
+
+
+class _VersionedServer(_BundledServer):
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+        self._mcp_server = _LowServer(name)
+
+
+def test_the_sdk_default_is_the_problem_being_fixed():
+    """Not a hypothetical. mcp.server.fastmcp.FastMCP takes no `version`
+    argument, so the low-level Server gets None and the SDK reports ITS OWN
+    version. Measured against a real worker: a freshly built pare-static-mcp
+    announced serverInfo.version "1.29.1", the mcp library's version."""
+    import inspect
+
+    from mcp.server.fastmcp import FastMCP
+
+    assert "version" not in inspect.signature(FastMCP.__init__).parameters
+    assert FastMCP("probe")._mcp_server.version is None
+
+
+def test_stamp_version_uses_installed_package_metadata():
+    server = _VersionedServer("pare-worker-kit")
+    stamped = stamp_version(server)
+    from pare_worker_kit import __version__
+    assert stamped == __version__ != None
+    assert server._mcp_server.version == __version__
+
+
+def test_an_explicit_version_wins():
+    server = _VersionedServer("pare-worker-kit")
+    assert stamp_version(server, "9.9.9") == "9.9.9"
+    assert server._mcp_server.version == "9.9.9"
+
+
+def test_an_uninstalled_name_leaves_the_version_alone():
+    """A worker run from a source tree with no metadata must still start."""
+    server = _VersionedServer("not-a-real-distribution-name-anywhere")
+    assert stamp_version(server) is None
+    assert server._mcp_server.version is None
+
+
+def test_a_server_without_a_lowlevel_handle_is_tolerated():
+    assert stamp_version(_StandaloneServer()) is None
+
+
+def test_run_worker_stamps_before_serving():
+    """The daemon reads serverInfo at initialize, so it has to be set by the
+    time the transport starts -- not left to each worker to remember."""
+    server = _VersionedServer("pare-worker-kit")
+    run_worker(server, env={})
+    from pare_worker_kit import __version__
+    assert server._mcp_server.version == __version__
+    assert server.ran == {"transport": "stdio"}

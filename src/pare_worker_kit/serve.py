@@ -20,7 +20,8 @@ import os
 import socket
 from typing import Any
 
-__all__ = ["run_worker", "resolve_bind_address", "WorkerServeError"]
+__all__ = ["run_worker", "resolve_bind_address", "stamp_version",
+           "WorkerServeError"]
 
 DEFAULT_HOST = "127.0.0.1"
 """Loopback, so a worker launched with no configuration is not exposed."""
@@ -171,6 +172,46 @@ def _apply_http_settings(server: Any, host: str, port: int) -> bool:
     return True
 
 
+
+def stamp_version(server: Any, version: str | None = None) -> str | None:
+    """Make the worker advertise its OWN version at initialize.
+
+    Worth stating plainly, because the default is actively misleading:
+    mcp.server.fastmcp.FastMCP takes no `version` argument, so the low-level
+    Server it builds gets None, and the SDK then reports **its own version**
+    as serverInfo.version. Measured against a real worker, a freshly built
+    pare-static-mcp announced "1.29.1" -- the mcp library's version.
+
+    That matters because the daemon records serverInfo as the provenance for
+    a NETWORKED worker: it cannot spawn the process or stat a binary, so this
+    is the only thing that can change when the remote build changes. A field
+    that reports the SDK version instead is worse than absent, because it
+    looks like provenance and stays constant across every redeploy.
+
+    The version is looked up from installed package metadata using the
+    server's own name (the workers name their FastMCP instance after their
+    distribution). Best-effort: a worker running from a source tree with no
+    metadata simply keeps whatever it had.
+    """
+    low = getattr(server, "_mcp_server", None)
+    if low is None:
+        return None
+    if version is None:
+        name = getattr(server, "name", None) or getattr(low, "name", None)
+        if not name:
+            return None
+        try:
+            from importlib.metadata import PackageNotFoundError, version as _v
+        except ImportError:                                   # pragma: no cover
+            return None
+        try:
+            version = _v(name)
+        except PackageNotFoundError:
+            return None
+    low.version = version
+    return version
+
+
 def run_worker(server: Any, *, default_transport: str = "stdio",
                env_prefix: str = "AGENT_WORKER_",
                env: dict[str, str] | None = None) -> None:
@@ -180,6 +221,10 @@ def run_worker(server: Any, *, default_transport: str = "stdio",
     would have been wrong.
     """
     env = os.environ if env is None else env
+    # Before serving either way: the daemon reads serverInfo as a networked
+    # worker's only provenance, and the SDK's default value is its own
+    # version rather than ours.
+    stamp_version(server)
     transport = (env.get(f"{env_prefix}TRANSPORT") or default_transport).strip().lower()
 
     if transport in ("stdio",):
