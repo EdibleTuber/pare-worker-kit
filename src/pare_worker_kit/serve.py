@@ -18,6 +18,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
+import sys
 from typing import Any
 
 __all__ = ["run_worker", "resolve_bind_address", "stamp_version",
@@ -61,6 +62,42 @@ def _interface_address(name: str) -> str | None:
         sock.close()
 
 
+
+def _interfaces_with_ipv4() -> list[tuple[str, str]]:
+    """Every interface that currently has an IPv4 address, for error messages.
+
+    Reads /proc/net/dev for names and asks the kernel for each address, rather
+    than shelling out to `ip`: a worker may be on a minimal image with no
+    iproute2, and an error path must not itself fail.
+    """
+    found: list[tuple[str, str]] = []
+    try:
+        with open("/proc/net/dev") as fh:
+            names = [line.split(":")[0].strip()
+                     for line in fh.read().splitlines()[2:] if ":" in line]
+    except OSError:
+        return found
+    for name in names:
+        addr = _interface_address(name)
+        if addr:
+            found.append((name, addr))
+    return found
+
+
+def _interface_hint() -> str:
+    """What to try instead. A refusal that does not name the alternatives makes
+    the operator go and find them by hand, which is the step this exists to
+    save -- and on a headless Pi at a bench it is the slow step."""
+    available = _interfaces_with_ipv4()
+    if not available:
+        return ("No interface on this machine currently has an IPv4 address. "
+                "If you expected a tailnet interface, the daemon may not be up "
+                "yet: check `tailscale status`.")
+    listed = ", ".join(f"{n} ({a})" for n, a in available)
+    return (f"Interfaces with an IPv4 address right now: {listed}. "
+            f"Use one of those names, or the address itself.")
+
+
 def resolve_bind_address(host: str) -> str:
     """Turn what the operator wrote into the literal address we will bind.
 
@@ -92,7 +129,8 @@ def resolve_bind_address(host: str) -> str:
             except socket.gaierror as exc:
                 raise WorkerServeError(
                     f"host {host!r} is neither an IP address, a network "
-                    f"interface on this machine, nor a resolvable name: {exc}"
+                    f"interface on this machine, nor a resolvable name: {exc}."
+                    f"\n{_interface_hint()}"
                 ) from exc
             addr = ipaddress.ip_address(info[0][4][0])
 
@@ -220,6 +258,32 @@ def run_worker(server: Any, *, default_transport: str = "stdio",
     Raises WorkerServeError, before binding anything, for every launch that
     would have been wrong.
     """
+    try:
+        _run_worker(server, default_transport=default_transport,
+                    env_prefix=env_prefix, env=env)
+    except WorkerServeError as exc:
+        # A CONFIGURATION mistake is not a crash, and printing eight frames of
+        # traceback for one buries the one line that says what to change.
+        # Observed twice while bringing the first remote worker up: a missing
+        # AGENT_WORKER_PORT and an unresolvable AGENT_WORKER_HOST each arrived
+        # in the journal as a full Python stack, with the actionable sentence
+        # last and truncated by journalctl's line wrapping.
+        #
+        # Exit 2 rather than 1, so a config refusal is distinguishable in
+        # `systemctl status` from the worker failing at runtime.
+        print(f"{_program_name()}: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(2) from None
+
+
+def _program_name() -> str:
+    return os.path.basename(sys.argv[0]) or "pare-worker-kit"
+
+
+def _run_worker(server: Any, *, default_transport: str, env_prefix: str,
+                env: dict[str, str] | None) -> None:
+    """The actual logic. Separate so tests can assert on WorkerServeError
+    rather than on a SystemExit, and so the message-and-exit behaviour above
+    stays a thin, obviously-correct wrapper."""
     env = os.environ if env is None else env
     # Before serving either way: the daemon reads serverInfo as a networked
     # worker's only provenance, and the SDK's default value is its own
