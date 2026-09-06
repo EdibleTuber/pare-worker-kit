@@ -282,11 +282,22 @@ def test_the_sdk_default_is_the_problem_being_fixed():
 
 
 def test_stamp_version_uses_installed_package_metadata():
+    """Asserts the RELATIONSHIP, not a literal.
+
+    Comparing against the source `__version__` couples this test to a
+    reinstall: bumping the version in pyproject.toml makes source and
+    installed metadata disagree until `pip install -e .` runs again, so the
+    test would fail on the one change it should be indifferent to. What
+    stamp_version actually promises is that a worker reports the version of
+    the package that is INSTALLED -- which is the value an operator comparing
+    two audit rows is looking at.
+    """
+    from importlib.metadata import version as installed_version
+
     server = _VersionedServer("pare-worker-kit")
     stamped = stamp_version(server)
-    from pare_worker_kit import __version__
-    assert stamped == __version__ != None
-    assert server._mcp_server.version == __version__
+    assert stamped == installed_version("pare-worker-kit")
+    assert server._mcp_server.version == stamped
 
 
 def test_an_explicit_version_wins():
@@ -309,8 +320,9 @@ def test_a_server_without_a_lowlevel_handle_is_tolerated():
 def test_run_worker_stamps_before_serving():
     """The daemon reads serverInfo at initialize, so it has to be set by the
     time the transport starts -- not left to each worker to remember."""
+    from importlib.metadata import version as installed_version
+
     server = _VersionedServer("pare-worker-kit")
     run_worker(server, env={})
-    from pare_worker_kit import __version__
-    assert server._mcp_server.version == __version__
+    assert server._mcp_server.version == installed_version("pare-worker-kit")
     assert server.ran == {"transport": "stdio"}
