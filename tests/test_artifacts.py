@@ -163,7 +163,8 @@ def test_a_name_longer_than_the_cap_is_refused():
     exactly it passes. This survives a legitimate change to the cap."""
     from pare_worker_kit.artifacts import _NAME_MAX
     ok = "a" * _NAME_MAX
-    assert artifact_path("/mnt/bench-store", "router-b", ok).endswith(ok)
+    out = artifact_path("/mnt/bench-store", "router-b", ok)
+    assert out.split("/") == ["", "mnt", "bench-store", "router-b", ok]
     with pytest.raises(ArtifactPathError, match="artifact name"):
         artifact_path("/mnt/bench-store", "router-b", "a" * (_NAME_MAX + 1))
 
@@ -171,17 +172,28 @@ def test_a_name_longer_than_the_cap_is_refused():
 def test_a_slug_longer_than_the_cap_is_refused():
     from pare_worker_kit.artifacts import _SLUG_MAX
     ok = "a" * _SLUG_MAX
-    assert artifact_path("/mnt/bench-store", ok, "fw.bin").endswith("fw.bin")
+    out = artifact_path("/mnt/bench-store", ok, "fw.bin")
+    # Every component, not `.endswith("fw.bin")`: that was true of any
+    # successful call and so discriminated nothing. The content of the
+    # positive half is that the slug survives as its own component.
+    assert out.split("/") == ["", "mnt", "bench-store", ok, "fw.bin"]
     with pytest.raises(ArtifactPathError, match="slug"):
         artifact_path("/mnt/bench-store", "a" * (_SLUG_MAX + 1), "fw.bin")
 
 
-def test_an_absolute_root_containing_a_traversal_is_refused(tmp_path):
+def test_an_absolute_root_containing_a_traversal_is_refused():
     """`/mnt/store/../../etc` is absolute and passes a startswith('/') test,
     but it does not name what the operator wrote down. Refuse it at the door
-    rather than silently writing somewhere else."""
-    with pytest.raises(ArtifactPathError, match="normalised|absolute"):
+    rather than silently writing somewhere else.
+
+    The match is tight on purpose. `"normalised|absolute"` also accepted a
+    refusal for the WRONG reason -- the absolute-root check firing on an
+    absolute path -- so it could not tell a working guard from a broken one.
+    """
+    with pytest.raises(ArtifactPathError,
+                       match="artifact root must be normalised") as e:
         artifact_path("/mnt/bench-store/../../etc", "router-b", "fw.bin")
+    assert "'..' component" in str(e.value)
 
 
 def test_a_symlink_inside_the_root_is_still_refused(tmp_path):
@@ -222,17 +234,41 @@ def test_the_returned_path_is_absolute_and_under_the_root(tmp_path):
     assert os.path.commonpath([out, str(tmp_path)]) == str(tmp_path)
 
 
-def test_the_containment_backstop_is_not_dead_code():
-    """`//` is the one input that reaches the final commonpath check: POSIX
-    keeps exactly two leading slashes through normpath, but commonpath
-    collapses them, so root and prefix disagree and the path is refused.
+@pytest.mark.parametrize("root", ["//", "//a", "//mnt/store", "//mnt//store/"])
+def test_a_root_that_is_not_a_prefix_of_itself_is_refused_as_ambiguous(root):
+    """The property, not a slash count. `commonpath` is how containment is
+    decided, so a root that is not a `commonpath` prefix of ITSELF cannot have
+    containment checked against it at all.
 
-    Two things are pinned here. The behaviour -- an ambiguous root fails
-    closed. And the fact that the backstop is reachable at all, so it cannot
-    be deleted as unreachable by someone who checked only the happy path.
+    The first assertion proves the parametrised input actually has that
+    property, so this test cannot quietly stop exercising it if the stdlib's
+    normpath/commonpath behaviour ever changes -- it would fail here rather
+    than pass vacuously.
+
+    The second pins that such a root is refused BY NAME. It was previously
+    refused by the containment backstop, which fails closed but diagnoses the
+    wrong problem: an operator writing `artifact_root: //mnt/store` was told
+    their path escaped its own root.
     """
-    with pytest.raises(ArtifactPathError, match="escapes artifact root"):
-        artifact_path("//", "router-b", "fw.bin")
+    base = os.path.normpath(root)
+    assert os.path.commonpath([base, base]) != base
+    with pytest.raises(ArtifactPathError, match="ambiguous artifact root"):
+        artifact_path(root, "router-b", "fw.bin")
+
+
+@pytest.mark.parametrize("root", ["/mnt/store", "/mnt/store/", "/mnt//store",
+                                  "/mnt/./store", "/", "///mnt/store", "/a"])
+def test_every_accepted_root_is_a_commonpath_prefix_of_itself(root):
+    """The invariant the containment backstop rests on, and the reason that
+    backstop is unreachable rather than merely untriggered.
+
+    Pinning the invariant is what a test can honestly do here. Asserting the
+    backstop "is reachable" would be asserting the code is broken.
+    """
+    out = artifact_path(root, "router-b", "fw.bin")
+    base = os.path.normpath(root)
+    assert os.path.commonpath([base, base]) == base
+    assert os.path.commonpath([out, base]) == base
 
 
 @pytest.mark.parametrize("root,expected_base", [
