@@ -181,6 +181,56 @@ def test_a_slug_longer_than_the_cap_is_refused():
         artifact_path("/mnt/bench-store", "a" * (_SLUG_MAX + 1), "fw.bin")
 
 
+def test_the_slug_rule_is_pinned_here_and_not_only_against_agent_core():
+    """A LOCAL pin on the EFFECTIVE rule. Nothing above was one.
+
+    `test_the_slug_rule_agrees_with_agent_cores` is an importorskip guard: it
+    SKIPS whenever agent_core is not installed, which is every routine run of
+    this suite and every job in this package's CI. And the boundary test above
+    derives its lengths from `_SLUG_MAX`, so it stays green for whatever value
+    the constant happens to hold. Measured: `_SLUG_MAX = 32` left this suite
+    fully green, while agent_core's suite -- which pins the rule itself --
+    failed three tests.
+
+    The lengths and the alphabet below are deliberately literal. This is not
+    an internal tunable that may drift: it is ArcticBase's rule crossing a
+    wire, stated independently in each package for the same reason
+    PRODUCES_META_KEY is. Loosening it here without loosening it there means
+    the daemon hands the worker a slug the worker refuses; tightening it here
+    means the reverse. Either direction has to fail a test in THIS suite.
+    """
+    from pare_worker_kit.artifacts import SLUG_RE
+
+    # The boundary, stated absolutely rather than via the constant.
+    assert SLUG_RE.fullmatch("a" * 64)
+    assert not SLUG_RE.fullmatch("a" * 65)
+
+    # The alphabet: what is admitted...
+    for ok in ("a", "0", "router-b", "proj_2", "0target", "fw-dump_2026"):
+        assert SLUG_RE.fullmatch(ok), ok
+    # ...and what is not. `-rf` and a traversal are the two that matter: a
+    # slug becomes a directory name in the scp/tar command an operator runs
+    # by hand.
+    for bad in ("UPPER", "_leading", "-rf", "--checkpoint-action=exec=sh",
+                "a/b", "proj/../../etc", "has space", "", "Unicode\u00e9"):
+        assert not SLUG_RE.fullmatch(bad), bad
+
+    # Case-insensitivity is checked through BEHAVIOUR rather than through a
+    # flags integer, so that a legitimate no-op flag change (re.ASCII, say,
+    # over an already-ASCII alphabet) does not fail while the change that
+    # actually matters still does: under re.IGNORECASE `[a-z]` matches
+    # U+212A KELVIN SIGN and U+017F LATIN SMALL LETTER LONG S.
+    assert not SLUG_RE.fullmatch("\u212a")
+    assert not SLUG_RE.fullmatch("\u017f")
+
+    # And the rule as the public entry point applies it, so the pin cannot be
+    # satisfied by a regex the function has stopped consulting.
+    assert artifact_path("/mnt/bench-store", "a" * 64, "fw.bin") == (
+        "/mnt/bench-store/" + "a" * 64 + "/fw.bin")
+    with pytest.raises(ArtifactPathError, match="slug"):
+        artifact_path("/mnt/bench-store", "a" * 65, "fw.bin")
+
+
 def test_an_absolute_root_containing_a_traversal_is_refused():
     """`/mnt/store/../../etc` is absolute and passes a startswith('/') test,
     but it does not name what the operator wrote down. Refuse it at the door
