@@ -26,3 +26,47 @@ jobs:
           pip install -e ".[dev]"
       - name: Run tests
         run: pytest -v
+
+  cross-package:
+    # A separate job, and 3.12 only, because agent_core declares
+    # requires-python >=3.12 -- it cannot be installed on this package's 3.10
+    # matrix leg, and this package must keep supporting 3.10 for the Pi.
+    #
+    # The `pytest` job above still SKIPS these guards, which is correct: the
+    # kit's own dependency set must stay `mcp` alone, and agent_core is a test
+    # fixture here, not a dependency. This job is where the comparison is
+    # actually made.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install this package and agent_core from source
+        # From git, NOT a published release. A guard satisfied by a stale
+        # published agent_core asserts agreement with a snapshot rather than
+        # with the code under test -- and unlike a skip, it looks like a pass.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install "agent_core @ git+https://github.com/EdibleTuber/agent_core.git"
+      - name: Cross-package guards must run, not skip
+        run: |
+          python -m pytest -k "agrees_with_agent_core" --junitxml=guards.xml -q
+          python - <<'CHECK'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("guards.xml").getroot()
+          suite = root.find("testsuite")
+          suite = root if suite is None else suite
+          tests = int(suite.get("tests", 0))
+          skipped = int(suite.get("skipped", 0))
+          print(f"cross-package guards: {tests} collected, {skipped} skipped")
+          if tests == 0:
+              sys.exit("no cross-package guard tests were collected -- the -k "
+                       "filter no longer matches any test. Fix the filter; do "
+                       "not delete this step.")
+          if skipped:
+              sys.exit(f"{skipped} cross-package guard(s) SKIPPED. A skipped "
+                       "guard proves nothing: agent_core was not importable, "
+                       "so the wire constants were never compared.")
+          CHECK
