@@ -1,6 +1,13 @@
 # pare-worker-kit
 
-The server half of a PARE worker: the risk-tier metadata key, and `run_worker`.
+The server half of a PARE worker: the wire constants a worker and the daemon
+must agree on, contained artifact paths, and `run_worker`.
+
+Depends on `mcp` alone, so a worker on a Raspberry Pi stays small. For the
+current public surface, `python -c "import pare_worker_kit as k;
+print(k.__all__)"` — deliberately not listed here, because an earlier
+version of this line described two names when there were eight, and the
+follow-up note that caught it said eight when there were twelve.
 
 ## Why this exists separately
 
@@ -101,8 +108,12 @@ disables it whenever no settings are passed, which is what FastMCP does.
 
 ## Related
 
-- `agent_core` — the client side, which re-exports `RISK_TIER_META_KEY` so
-  there is exactly one definition of it.
+- `agent_core` — the client side. It does **not** import this package; it
+  states the shared wire constants as its own literals, because the daemon and
+  a worker are installed separately and never share a Python environment. Each
+  side carries a guard test asserting the other's values match when it is
+  installed. Two definitions, deliberately, kept honest by tests — not one
+  definition re-exported, which is what this section used to claim.
 - `PARE/docs/superpowers/specs/2026-09-05-networked-workers-design.md` — the
   design this implements, including the trust-boundary decision and what
   would invalidate it.
