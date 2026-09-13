@@ -6,19 +6,34 @@ tool code does not change.
     AGENT_WORKER_TRANSPORT   stdio | http          (default: stdio)
     AGENT_WORKER_HOST        address or interface  (default: 127.0.0.1)
     AGENT_WORKER_PORT        port                  (required when http)
+    AGENT_WORKER_REQUEST_LOG path to the request log (default: see below)
 
 The bind address is the access control. This deployment has no
 application-level authentication -- the trust boundary is a Tailscale
 tailnet plus the operator's LAN -- so anything that can route to the port
 can call any tool the worker exposes. That is a deliberate decision, and it
 only holds while the port is not on a wildcard. Hence _resolve_host().
+
+Over stdio, the daemon spawned the worker and holds its pipe, so the
+daemon's own audit log is already a total record of what the worker did.
+Over HTTP that stops being true -- anything that can route to the port can
+call a tool directly, and the daemon never sees it. So the HTTP path alone
+also keeps its OWN request log: peer address, tool name, a timestamp, and a
+hash of the arguments (never the argument values -- a console `send` may
+carry credentials typed at a target's prompt). It defaults to
+$XDG_STATE_HOME/pare-worker/requests.log, or ~/.local/state/pare-worker/
+requests.log if that is unset, and a failure to write it never fails the
+request that produced it.
 """
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import json
 import os
 import socket
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 __all__ = ["run_worker", "resolve_bind_address", "stamp_version",
@@ -211,6 +226,122 @@ def _apply_http_settings(server: Any, host: str, port: int) -> bool:
 
 
 
+def _default_request_log_path() -> str:
+    """Where the log goes when the operator has not said.
+
+    Under the invoking user's own state directory, not a system path such as
+    /var/log: a worker on a Pi at a bench is commonly started as an
+    unprivileged user, and a default this function cannot write to would
+    make the FIRST request the one that silently loses its record.
+    XDG_STATE_HOME is respected for anyone who has set it.
+    """
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "pare-worker", "requests.log")
+
+
+def _peer_address(mcp_server: Any) -> str:
+    """The caller's address for the request currently being handled.
+
+    mcp attaches the transport's Starlette Request to the low-level
+    server's request-context ONLY for HTTP-shaped transports (streamable
+    HTTP, SSE); a stdio session never constructs one, so this is also the
+    mechanism that makes the hook a no-op if it were ever reached from
+    stdio. Every step here is best-effort: this runs inside the logging
+    path, and the logging path must never be why a request fails.
+    """
+    try:
+        request = mcp_server.request_context.request
+    except LookupError:
+        return "unknown"
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None)
+    if not host:
+        return "unknown"
+    port = getattr(client, "port", None)
+    return f"{host}:{port}" if port is not None else str(host)
+
+
+def _record_request(mcp_server: Any, log_path: str, req: Any) -> None:
+    """Append one line: timestamp, peer, tool, and a hash of the arguments.
+
+    Never the arguments themselves (invariant 1) -- a console `send` payload
+    can carry credentials typed at a target's login prompt, and the hash
+    answers "was this the same call" without giving those credentials a new
+    place to live. Arguments are canonicalised (sorted keys) before hashing
+    so the same call hashes the same way regardless of the key order a
+    particular client happened to send.
+
+    Every exception is swallowed (invariant 3): a full disk, a missing
+    directory, a permissions error, or an unpicklable argument must cost the
+    operator one missing log line, never the request that produced it.
+    """
+    try:
+        tool = getattr(req.params, "name", None) or "?"
+        arguments = getattr(req.params, "arguments", None) or {}
+        digest = hashlib.sha256(
+            json.dumps(arguments, sort_keys=True, default=str).encode("utf-8", "replace")
+        ).hexdigest()
+        peer = _peer_address(mcp_server)
+        ts = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        line = f"{ts} peer={peer} tool={tool} args_sha256={digest}\n"
+
+        directory = os.path.dirname(log_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
+def _install_request_log(server: Any, *, env: dict[str, str], env_prefix: str) -> None:
+    """Make every tool call over THIS transport record itself, independent
+    of the daemon (invariant 2: the log must survive the daemon, so it is a
+    file on the worker's own disk, not something held only in the daemon's
+    memory).
+
+    Only called from the HTTP branch of `_run_worker` -- stdio workers are
+    unaffected (invariant 4), because over stdio the daemon spawned the
+    child and holds its pipe, so the daemon's own audit log already is a
+    total record; over HTTP anything that can route to the port can call a
+    tool directly and the daemon never sees it.
+
+    Why this patches `request_handlers[CallToolRequest]` rather than
+    wrapping `server.call_tool`: `FastMCP.__init__` calls
+    `self._mcp_server.call_tool(validate_input=False)(self.call_tool)`
+    during construction, which closes the low-level dispatcher over the
+    bound method it was handed AT THAT TIME. `server` reaches `run_worker`
+    already constructed, so reassigning the `call_tool` attribute on the
+    instance would rebind a name that closure no longer looks up.
+    `request_handlers` is a plain dict read at dispatch time, so replacing
+    its entry is seen by every subsequent call.
+    """
+    try:
+        from mcp import types
+    except ImportError:                                   # pragma: no cover
+        return
+    mcp_server = getattr(server, "_mcp_server", None)
+    handlers = getattr(mcp_server, "request_handlers", None)
+    if handlers is None:
+        return
+    original = handlers.get(types.CallToolRequest)
+    if original is None:
+        return
+
+    log_path = (env.get(f"{env_prefix}REQUEST_LOG")
+                or _default_request_log_path())
+
+    async def logged(req: Any) -> Any:
+        # Recorded before the tool runs, not after: a hardware call that
+        # hangs or crashes the process (the exact case this log exists for)
+        # must still leave a record that it was attempted.
+        _record_request(mcp_server, log_path, req)
+        return await original(req)
+
+    handlers[types.CallToolRequest] = logged
+
+
 def stamp_version(server: Any, version: str | None = None) -> str | None:
     """Make the worker advertise its OWN version at initialize.
 
@@ -306,7 +437,11 @@ def _run_worker(server: Any, *, default_transport: str, env_prefix: str,
     host = resolve_bind_address(env.get(f"{env_prefix}HOST") or DEFAULT_HOST)
     port = _port_from_env(env.get(f"{env_prefix}PORT"), f"{env_prefix}PORT")
 
-    if _apply_http_settings(server, host, port):
+    took_settings = _apply_http_settings(server, host, port)
+    # Only the HTTP branch reaches this: stdio returned above, so this is
+    # exactly the boundary invariant 4 depends on.
+    _install_request_log(server, env=env, env_prefix=env_prefix)
+    if took_settings:
         server.run(transport="streamable-http")
     else:
         server.run(transport="streamable-http", host=host, port=port)
