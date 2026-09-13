@@ -19,11 +19,14 @@ daemon's own audit log is already a total record of what the worker did.
 Over HTTP that stops being true -- anything that can route to the port can
 call a tool directly, and the daemon never sees it. So the HTTP path alone
 also keeps its OWN request log: peer address, tool name, a timestamp, and a
-hash of the arguments (never the argument values -- a console `send` may
-carry credentials typed at a target's prompt). It defaults to
+salted hash of the arguments (never the argument values -- a console `send`
+may carry credentials typed at a target's prompt). It defaults to
 $XDG_STATE_HOME/pare-worker/requests.log, or ~/.local/state/pare-worker/
 requests.log if that is unset, and a failure to write it never fails the
-request that produced it.
+request that produced it. The hash is for correlation, not confidentiality:
+its salt is written into the same file, so a short argument value is
+recoverable by brute force by anyone who can already read the log -- see
+`_record_request`.
 """
 from __future__ import annotations
 
@@ -31,6 +34,8 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
+import secrets
 import socket
 import sys
 from datetime import datetime, timezone
@@ -240,6 +245,40 @@ def _default_request_log_path() -> str:
     return os.path.join(base, "pare-worker", "requests.log")
 
 
+_SAFE_TOOL_NAME_CHAR = re.compile(r"[A-Za-z0-9_.\-]")
+
+
+def _sanitize_tool_name(name: str) -> str:
+    """Make a tool name safe to interpolate into a single-line, space
+    delimited log record.
+
+    `CallToolRequestParams.name` is a bare `str` with no pattern constraint,
+    and the module docstring's own threat model is "anything that can route
+    to the port" -- so `name` is attacker-controlled. Left unescaped, a name
+    containing a newline could write extra fake lines into the file, and one
+    containing the literal text " peer=", " tool=" or " args_sha256=" could
+    forge a field within a single line -- in both cases making the log an
+    attack surface against the exact audit trail it exists to provide,
+    before the tool call is even validated as real.
+
+    Every character outside the identifier set every real tool name in this
+    system uses (letters, digits, `_`, `-`, `.`) is replaced by its escaped
+    hex form, which by construction cannot itself contain a space, `=`, or
+    newline. The escaping is total, not a blocklist of the three known
+    tokens above: a blocklist only ever covers the attacks someone thought
+    of first.
+    """
+    if name and all(_SAFE_TOOL_NAME_CHAR.fullmatch(c) for c in name):
+        return name
+    escaped = []
+    for ch in name:
+        if _SAFE_TOOL_NAME_CHAR.fullmatch(ch):
+            escaped.append(ch)
+        else:
+            escaped.extend(f"\\x{b:02x}" for b in ch.encode("utf-8", "replace"))
+    return "".join(escaped)
+
+
 def _peer_address(mcp_server: Any) -> str:
     """The caller's address for the request currently being handled.
 
@@ -249,6 +288,11 @@ def _peer_address(mcp_server: Any) -> str:
     mechanism that makes the hook a no-op if it were ever reached from
     stdio. Every step here is best-effort: this runs inside the logging
     path, and the logging path must never be why a request fails.
+
+    Not sanitised like the tool name: this comes from the OS's own idea of
+    who connected the socket (`Request.client`, populated by the ASGI
+    server from the accepted connection), not from anything inside the
+    JSON-RPC payload an attacker controls the bytes of.
     """
     try:
         request = mcp_server.request_context.request
@@ -262,6 +306,43 @@ def _peer_address(mcp_server: Any) -> str:
     return f"{host}:{port}" if port is not None else str(host)
 
 
+_PROCESS_SALT: str | None = None
+
+
+def _request_log_salt() -> str:
+    """One random salt per process, used to hash every request this process
+    logs.
+
+    This is NOT key management and does not make the hash a place secrets
+    can safely live -- the salt is written into the log itself (see
+    `_install_request_log`), so anyone who can read the log can read the
+    salt next to it. What it buys: a table of sha256(short-guess) values
+    precomputed ONCE, offline, before ever seeing this file cannot be
+    reused against it, and the same table cannot be reused across a
+    restart or across another worker either, because each process rolls
+    its own salt. An attacker who already has the log and is willing to
+    compute after reading it is unaffected -- see the residual-limit note
+    on `_record_request`.
+    """
+    global _PROCESS_SALT
+    if _PROCESS_SALT is None:
+        _PROCESS_SALT = secrets.token_hex(16)
+    return _PROCESS_SALT
+
+
+def _write_log_line(log_path: str, line: str) -> None:
+    """The one place that touches the filesystem for this feature, so the
+    swallow-everything behaviour (invariant 3) lives in exactly one spot."""
+    try:
+        directory = os.path.dirname(log_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
 def _record_request(mcp_server: Any, log_path: str, req: Any) -> None:
     """Append one line: timestamp, peer, tool, and a hash of the arguments.
 
@@ -270,29 +351,49 @@ def _record_request(mcp_server: Any, log_path: str, req: Any) -> None:
     answers "was this the same call" without giving those credentials a new
     place to live. Arguments are canonicalised (sorted keys) before hashing
     so the same call hashes the same way regardless of the key order a
-    particular client happened to send.
+    particular client happened to send, and salted per-process (see
+    `_request_log_salt`) so a table precomputed before this file existed is
+    not reusable against it.
+
+    RESIDUAL LIMIT, stated plainly rather than implied: this hash is for
+    correlation ("was this the same call as that other line"), not
+    confidentiality. A short argument value -- a short password, a short
+    data_b64 payload -- is recoverable by brute force by anyone who can
+    already read this file, salt included, because the salt is stored right
+    next to the hash it salts. Do not treat this file as a place a secret is
+    safe merely because it is hashed.
 
     Every exception is swallowed (invariant 3): a full disk, a missing
-    directory, a permissions error, or an unpicklable argument must cost the
+    directory, a permissions error, or an unhashable argument must cost the
     operator one missing log line, never the request that produced it.
     """
     try:
-        tool = getattr(req.params, "name", None) or "?"
+        tool = _sanitize_tool_name(getattr(req.params, "name", None) or "?")
         arguments = getattr(req.params, "arguments", None) or {}
+        salt = _request_log_salt()
+        canonical = json.dumps(arguments, sort_keys=True, default=str)
         digest = hashlib.sha256(
-            json.dumps(arguments, sort_keys=True, default=str).encode("utf-8", "replace")
+            (salt + canonical).encode("utf-8", "replace")
         ).hexdigest()
         peer = _peer_address(mcp_server)
         ts = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         line = f"{ts} peer={peer} tool={tool} args_sha256={digest}\n"
-
-        directory = os.path.dirname(log_path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write(line)
+        _write_log_line(log_path, line)
     except Exception:
         pass
+
+
+def _warn_request_log_disabled(reason: str) -> None:
+    """Loud, not silent: an audit control that quietly stops auditing is
+    worse than one that visibly refuses to start. `_install_request_log`
+    only runs once, at launch, so this is not a per-request spam risk in
+    production -- it fires at most once per worker process."""
+    print(
+        f"{_program_name()}: request logging is DISABLED for this process "
+        f"-- {reason}. Networked-transport tool calls will NOT be audited "
+        f"until this is fixed.",
+        file=sys.stderr, flush=True,
+    )
 
 
 def _install_request_log(server: Any, *, env: dict[str, str], env_prefix: str) -> None:
@@ -316,21 +417,46 @@ def _install_request_log(server: Any, *, env: dict[str, str], env_prefix: str) -
     instance would rebind a name that closure no longer looks up.
     `request_handlers` is a plain dict read at dispatch time, so replacing
     its entry is seen by every subsequent call.
+
+    Every no-op path below is loud (`_warn_request_log_disabled`), not a
+    silent `return`. `mcp` is pinned to a range (`>=1.27.0,<2`), not a
+    single version; a routine upgrade inside that range could rename or
+    restructure any of `_mcp_server`, `request_handlers`, or
+    `CallToolRequest` without this package changing at all, and a worker
+    that stopped auditing itself without saying so would be exactly the
+    "PARE cannot establish whether it did it" failure this feature exists
+    to close.
     """
     try:
         from mcp import types
     except ImportError:                                   # pragma: no cover
+        _warn_request_log_disabled("could not import mcp.types")
         return
     mcp_server = getattr(server, "_mcp_server", None)
+    if mcp_server is None:
+        _warn_request_log_disabled(
+            "the server object has no _mcp_server attribute; the mcp SDK's "
+            "internal shape may have changed")
+        return
     handlers = getattr(mcp_server, "request_handlers", None)
     if handlers is None:
+        _warn_request_log_disabled(
+            "server._mcp_server has no request_handlers dict; the mcp "
+            "SDK's internal shape may have changed")
         return
     original = handlers.get(types.CallToolRequest)
     if original is None:
+        _warn_request_log_disabled(
+            "no CallToolRequest handler is registered yet; the mcp SDK's "
+            "handler-registration order may have changed")
         return
 
     log_path = (env.get(f"{env_prefix}REQUEST_LOG")
                 or _default_request_log_path())
+    ts = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    _write_log_line(
+        log_path,
+        f"{ts} event=log_started salt={_request_log_salt()} pid={os.getpid()}\n")
 
     async def logged(req: Any) -> Any:
         # Recorded before the tool runs, not after: a hardware call that
