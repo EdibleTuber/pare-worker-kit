@@ -20,17 +20,27 @@ Over HTTP that stops being true -- anything that can route to the port can
 call a tool directly, and the daemon never sees it. So the HTTP path alone
 also keeps its OWN request log: peer address, tool name, a timestamp, and a
 salted hash of the arguments (never the argument values -- a console `send`
-may carry credentials typed at a target's prompt). It defaults to
-$XDG_STATE_HOME/pare-worker/requests.log, or ~/.local/state/pare-worker/
-requests.log if that is unset, and a failure to write it never fails the
-request that produced it. The hash is for correlation, not confidentiality:
-its salt is written into the same file, so a short argument value is
-recoverable by brute force by anyone who can already read the log -- see
-`_record_request`.
+may carry credentials typed at a target's prompt). The peer address is the
+accepted connection's, not a header's: the HTTP path serves with uvicorn's
+`proxy_headers` switched OFF, because uvicorn otherwise rewrites it from
+`X-Forwarded-For` for any connection from 127.0.0.1 -- which is this
+module's own DEFAULT_HOST. See `_uvicorn_ignoring_forwarded_headers`.
+
+The log defaults to $XDG_STATE_HOME/pare-worker/requests.log, or
+~/.local/state/pare-worker/requests.log if that is unset. A failure to write
+it never fails the request that produced it -- but a failure to write it at
+LAUNCH is announced on stderr, because an audit control that silently stops
+auditing is the failure this whole feature exists to prevent.
+
+The hash is for correlation, not confidentiality: its salt is written into
+the same file, so a short argument value is recoverable by brute force by
+anyone who can already read the log -- see `_record_request`.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import inspect
 import ipaddress
 import json
 import os
@@ -246,37 +256,62 @@ def _default_request_log_path() -> str:
 
 
 _SAFE_TOOL_NAME_CHAR = re.compile(r"[A-Za-z0-9_.\-]")
+"""The identifier set every real tool name in this system uses."""
+
+_SAFE_PEER_CHAR = re.compile(r"[A-Za-z0-9_.\-:%]")
+"""The tool-name set plus `:` and `%`, which a peer legitimately contains.
+
+A peer is written `host:port`, and `host` may be an IPv6 literal
+(`fe80::1`) with an optional zone id (`fe80::1%eth0`). The property the
+record's grammar actually needs from a field value is narrower than "looks
+like an identifier": fields are ` key=value` pairs on one line, so a value
+must not contain a space, an `=`, or a newline. `:` and `%` violate none of
+those, so admitting them keeps `peer=100.64.0.7:53214` and
+`peer=fe80::1%eth0:53214` readable without weakening the record. The
+escaping below stays a whitelist in both cases -- only the alphabet differs.
+"""
 
 
-def _sanitize_tool_name(name: str) -> str:
-    """Make a tool name safe to interpolate into a single-line, space
-    delimited log record.
+def _escape_for_log(value: str, safe: re.Pattern[str]) -> str:
+    """Make an untrusted string safe to interpolate into a single-line,
+    space-delimited log record.
 
-    `CallToolRequestParams.name` is a bare `str` with no pattern constraint,
-    and the module docstring's own threat model is "anything that can route
-    to the port" -- so `name` is attacker-controlled. Left unescaped, a name
-    containing a newline could write extra fake lines into the file, and one
-    containing the literal text " peer=", " tool=" or " args_sha256=" could
-    forge a field within a single line -- in both cases making the log an
-    attack surface against the exact audit trail it exists to provide,
-    before the tool call is even validated as real.
+    Both values interpolated into a record -- the tool name and the peer --
+    are attacker-influenced (see `_sanitize_tool_name` and `_peer_address`).
+    Left unescaped, either could contain a newline and write extra fake
+    lines into the file, or contain the literal text " peer=", " tool=" or
+    " args_sha256=" and forge a field within a single line -- in both cases
+    making the log an attack surface against the exact audit trail it
+    exists to provide, before the tool call is even validated as real.
 
-    Every character outside the identifier set every real tool name in this
-    system uses (letters, digits, `_`, `-`, `.`) is replaced by its escaped
-    hex form, which by construction cannot itself contain a space, `=`, or
-    newline. The escaping is total, not a blocklist of the three known
-    tokens above: a blocklist only ever covers the attacks someone thought
-    of first.
+    Every character outside `safe` is replaced by its escaped hex form,
+    which by construction cannot itself contain a space, `=`, or newline.
+    The escaping is total, not a blocklist of the three known tokens above:
+    a blocklist only ever covers the attacks someone thought of first.
     """
-    if name and all(_SAFE_TOOL_NAME_CHAR.fullmatch(c) for c in name):
-        return name
+    if value and all(safe.fullmatch(c) for c in value):
+        return value
     escaped = []
-    for ch in name:
-        if _SAFE_TOOL_NAME_CHAR.fullmatch(ch):
+    for ch in value:
+        if safe.fullmatch(ch):
             escaped.append(ch)
         else:
             escaped.extend(f"\\x{b:02x}" for b in ch.encode("utf-8", "replace"))
     return "".join(escaped)
+
+
+def _sanitize_tool_name(name: str) -> str:
+    """`CallToolRequestParams.name` is a bare `str` with no pattern
+    constraint, and the module docstring's own threat model is "anything
+    that can route to the port" -- so `name` is attacker-controlled."""
+    return _escape_for_log(name, _SAFE_TOOL_NAME_CHAR)
+
+
+def _sanitize_peer(peer: str) -> str:
+    """Defence in depth behind `proxy_headers=False` -- see `_peer_address`
+    for why a peer can be attacker-controlled at all, and
+    `_uvicorn_ignoring_forwarded_headers` for the primary fix."""
+    return _escape_for_log(peer, _SAFE_PEER_CHAR)
 
 
 def _peer_address(mcp_server: Any) -> str:
@@ -289,10 +324,31 @@ def _peer_address(mcp_server: Any) -> str:
     stdio. Every step here is best-effort: this runs inside the logging
     path, and the logging path must never be why a request fails.
 
-    Not sanitised like the tool name: this comes from the OS's own idea of
-    who connected the socket (`Request.client`, populated by the ASGI
-    server from the accepted connection), not from anything inside the
-    JSON-RPC payload an attacker controls the bytes of.
+    WHERE THIS VALUE COMES FROM, stated accurately -- an earlier version of
+    this docstring claimed it "comes from the OS's own idea of who
+    connected the socket ... not from anything inside the JSON-RPC payload
+    an attacker controls", and that was FALSE under this package's own
+    default bind. `Request.client` is `scope["client"]`, and uvicorn
+    defaults to `proxy_headers=True` with `forwarded_allow_ips="127.0.0.1"`
+    -- so it wraps the app in `ProxyHeadersMiddleware`, which OVERWRITES
+    `scope["client"]` from the `X-Forwarded-For` header whenever the
+    connection arrives from a trusted host. `DEFAULT_HOST` here is
+    `127.0.0.1`, which is exactly that trusted host, and
+    `mcp.server.fastmcp.FastMCP` builds its `uvicorn.Config` with only
+    app/host/port/log_level, so it never turns the behaviour off. On the
+    kit's own default bind, one request header therefore chose what this
+    function returned -- including the daemon's own address, which made the
+    log answer "did PARE do it?" with a forged yes.
+
+    `_uvicorn_ignoring_forwarded_headers` is the fix: `proxy_headers=False`
+    at the uvicorn layer, so `scope["client"]` is once again only the
+    accepted connection. `_sanitize_peer` below is defence in depth behind
+    it, NOT the fix -- a same-host TLS terminator, nginx, or SSH tunnel that
+    legitimately sets `X-Forwarded-For` reopens the question of whether the
+    string is trustworthy regardless of bind, and the log's format must not
+    additionally be forgeable by whatever ends up in it. Escaping makes a
+    peer value unable to fabricate a FIELD; only `proxy_headers=False` makes
+    it unable to fabricate an ADDRESS.
     """
     try:
         request = mcp_server.request_context.request
@@ -303,7 +359,103 @@ def _peer_address(mcp_server: Any) -> str:
     if not host:
         return "unknown"
     port = getattr(client, "port", None)
-    return f"{host}:{port}" if port is not None else str(host)
+    peer = f"{host}:{port}" if port is not None else str(host)
+    return _sanitize_peer(peer)
+
+
+def _uvicorn_can_ignore_forwarded_headers() -> tuple[bool, str]:
+    """Whether `_uvicorn_ignoring_forwarded_headers` can do its job here.
+
+    Checked BEFORE serving so the answer can be said out loud and written
+    into the log header, rather than discovered after a bricked target.
+    `uvicorn` is not this package's dependency -- it arrives underneath
+    `mcp`, which is unpinned as to uvicorn version -- so both the import and
+    the parameter are things that can go away without this package changing.
+    """
+    try:
+        import uvicorn
+    except ImportError as exc:                                # pragma: no cover
+        return False, f"uvicorn could not be imported ({exc})"
+    try:
+        params = inspect.signature(uvicorn.Config.__init__).parameters
+    except (TypeError, ValueError) as exc:                    # pragma: no cover
+        return False, f"uvicorn.Config's signature could not be read ({exc})"
+    if "proxy_headers" not in params:                         # pragma: no cover
+        return False, ("this uvicorn's Config takes no proxy_headers "
+                       "argument, so its X-Forwarded-For handling cannot be "
+                       "switched off from here")
+    return True, ""
+
+
+@contextlib.contextmanager
+def _uvicorn_ignoring_forwarded_headers(enabled: bool = True):
+    """Serve with uvicorn's X-Forwarded-For handling OFF.
+
+    THE PROBLEM. uvicorn's `Config` defaults to `proxy_headers=True` and
+    `forwarded_allow_ips="127.0.0.1"`, and `Config.load()` then wraps the
+    app in `ProxyHeadersMiddleware`, which replaces `scope["client"]` with
+    whatever the `X-Forwarded-For` header says when the connection came from
+    a trusted host. This package's `DEFAULT_HOST` is `127.0.0.1`. So under
+    the kit's own default, any client that can reach the port can dictate
+    the `peer=` field of every record it produces -- including setting it to
+    the daemon's address, which turns this log from evidence into a forgery
+    tool aimed at the one question it exists to answer.
+
+    WHY IT IS DONE THIS WAY. There is no supported route: `FastMCP.run()`
+    takes only `transport` and `mount_path`, `FastMCP.run_streamable_http_
+    async()` takes no arguments at all, and it constructs
+    `uvicorn.Config(app, host=..., port=..., log_level=...)` internally with
+    no hook of any kind. Reconstructing the app ourselves
+    (`server.streamable_http_app()` + our own `uvicorn.Server`) was the
+    alternative and is worse: it hard-codes SDK internals that the pin
+    (`mcp>=1.27.0,<2`) explicitly allows to move, and it would not cover the
+    standalone `fastmcp` package that `_apply_http_settings` also supports.
+    Overriding the two attributes on every `Config` built while we are
+    serving covers both, and touches nothing else.
+
+    `Config.__init__` does not call `Config.load()`; `Server.serve()` does,
+    and `load()` reads `self.proxy_headers` at that point -- which is why
+    setting the attribute after construction is sufficient, and why it is
+    done that way rather than by injecting a keyword argument into a
+    signature whose parameters are all positional-or-keyword (a caller that
+    passed `proxy_headers` positionally would then get "multiple values for
+    argument", turning a hardening measure into a crash on serve).
+
+    Scoped to the call and restored in `finally`: a process-global patch
+    installed at import would change uvicorn for anything else sharing the
+    interpreter, which for a library is not ours to do.
+    """
+    if not enabled:                                           # pragma: no cover
+        yield
+        return
+    import uvicorn
+    original = uvicorn.Config.__init__
+
+    def patched(self: Any, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs)
+        self.proxy_headers = False
+        # Unused once proxy_headers is False, but set anyway so that a
+        # future uvicorn which re-derives the middleware from this field
+        # alone still trusts nothing.
+        self.forwarded_allow_ips = []
+
+    uvicorn.Config.__init__ = patched
+    try:
+        yield
+    finally:
+        uvicorn.Config.__init__ = original
+
+
+def _warn_peer_addresses_unverified(reason: str) -> None:
+    """Loud, for the same reason `_warn_request_log_disabled` is: a log that
+    records a peer it cannot vouch for is worse than one that says so."""
+    print(
+        f"{_program_name()}: request-log peer addresses are NOT VERIFIED for "
+        f"this process -- {reason}. If anything can set X-Forwarded-For on a "
+        f"connection this worker trusts, the peer= field in the request log "
+        f"is attacker-controlled and must not be treated as evidence.",
+        file=sys.stderr, flush=True,
+    )
 
 
 _PROCESS_SALT: str | None = None
@@ -330,17 +482,39 @@ def _request_log_salt() -> str:
     return _PROCESS_SALT
 
 
-def _write_log_line(log_path: str, line: str) -> None:
+def _write_log_line(log_path: str, line: str) -> str | None:
     """The one place that touches the filesystem for this feature, so the
-    swallow-everything behaviour (invariant 3) lives in exactly one spot."""
+    swallow-everything behaviour (invariant 3) lives in exactly one spot.
+
+    Returns None on success, or a short description of the failure. It
+    still raises nothing, ever -- but the RESULT is now how the two callers
+    differ, and the asymmetry between them is the point:
+
+    * `_install_request_log` calls this ONCE, at launch, and checks the
+      result. A path that cannot be written is a control that will never
+      audit anything, and it must say so before the worker starts taking
+      requests -- an unwritable `AGENT_WORKER_REQUEST_LOG`, a read-only
+      mount or a full SD card used to produce a successful-looking install
+      with a silently dead audit trail, which is precisely the "PARE cannot
+      establish whether it did it" failure this feature exists to close.
+    * `_record_request` calls it per request and IGNORES the result
+      (invariant 3). A full disk must cost one missing line, never a live
+      hardware call -- taking a bench offline because a log line did not
+      fit is a worse outcome than the gap in the log.
+
+    Refusing to start loudly and never breaking a live request are not in
+    tension; they are the two halves of the same rule, applied at the two
+    moments where the right answer differs.
+    """
     try:
         directory = os.path.dirname(log_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(line)
-    except Exception:
-        pass
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 def _record_request(mcp_server: Any, log_path: str, req: Any) -> None:
@@ -396,7 +570,8 @@ def _warn_request_log_disabled(reason: str) -> None:
     )
 
 
-def _install_request_log(server: Any, *, env: dict[str, str], env_prefix: str) -> None:
+def _install_request_log(server: Any, *, env: dict[str, str], env_prefix: str,
+                         forwarded_for: str = "unknown") -> None:
     """Make every tool call over THIS transport record itself, independent
     of the daemon (invariant 2: the log must survive the daemon, so it is a
     file on the worker's own disk, not something held only in the daemon's
@@ -454,9 +629,33 @@ def _install_request_log(server: Any, *, env: dict[str, str], env_prefix: str) -
     log_path = (env.get(f"{env_prefix}REQUEST_LOG")
                 or _default_request_log_path())
     ts = datetime.now(timezone.utc).isoformat(timespec="microseconds")
-    _write_log_line(
+    # `forwarded_for` goes in the header because a reader months later has
+    # to know whether the peer= fields below it are evidence or hearsay,
+    # and the process that knew is long gone. See `_peer_address`.
+    failure = _write_log_line(
         log_path,
-        f"{ts} event=log_started salt={_request_log_salt()} pid={os.getpid()}\n")
+        f"{ts} event=log_started salt={_request_log_salt()} "
+        f"pid={os.getpid()} forwarded_for={_sanitize_peer(forwarded_for)}\n")
+    if failure is not None:
+        # The ONE write this feature does at launch, and the only one whose
+        # failure can be reported before requests start arriving. Without
+        # this check the install succeeded silently and every subsequent
+        # record was dropped just as silently -- the exact failure
+        # `_default_request_log_path` warns about, reached by a different
+        # route (an explicit REQUEST_LOG the operator cannot write, a
+        # read-only mount, a full disk).
+        _warn_request_log_disabled(
+            f"the log file {log_path!r} could not be written -- {failure}. "
+            f"Check {env_prefix}REQUEST_LOG, the directory's permissions, "
+            f"and free space")
+        # The hook is still installed, deliberately. The condition may be
+        # transient (a disk that frees up), and a hook costs nothing while
+        # it fails; refusing to install would guarantee no records even
+        # after the fault cleared. Nothing is raised either: a full disk
+        # must not be why a hardware bench will not start. Note the
+        # residual gap this leaves -- the salt line is what makes the
+        # digests below it correlatable, so records written after a failed
+        # header are hashes whose salt was never recorded.
 
     async def logged(req: Any) -> Any:
         # Recorded before the tool runs, not after: a hardware call that
@@ -564,10 +763,22 @@ def _run_worker(server: Any, *, default_transport: str, env_prefix: str,
     port = _port_from_env(env.get(f"{env_prefix}PORT"), f"{env_prefix}PORT")
 
     took_settings = _apply_http_settings(server, host, port)
+
+    # Before the log is installed, so its header can say which of the two
+    # it is: uvicorn trusts X-Forwarded-For from 127.0.0.1 by default and
+    # DEFAULT_HOST is 127.0.0.1, so without this the peer= field is a
+    # request header rather than a socket. See
+    # `_uvicorn_ignoring_forwarded_headers`.
+    can_harden, why_not = _uvicorn_can_ignore_forwarded_headers()
+    if not can_harden:                                        # pragma: no cover
+        _warn_peer_addresses_unverified(why_not)
+
     # Only the HTTP branch reaches this: stdio returned above, so this is
     # exactly the boundary invariant 4 depends on.
-    _install_request_log(server, env=env, env_prefix=env_prefix)
-    if took_settings:
-        server.run(transport="streamable-http")
-    else:
-        server.run(transport="streamable-http", host=host, port=port)
+    _install_request_log(server, env=env, env_prefix=env_prefix,
+                         forwarded_for="ignored" if can_harden else "UNVERIFIED")
+    with _uvicorn_ignoring_forwarded_headers(can_harden):
+        if took_settings:
+            server.run(transport="streamable-http")
+        else:
+            server.run(transport="streamable-http", host=host, port=port)

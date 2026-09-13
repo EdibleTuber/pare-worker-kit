@@ -454,3 +454,315 @@ def test_default_log_path_honours_xdg_state_home(monkeypatch, tmp_path):
 def test_peer_address_falls_back_to_unknown_with_no_client():
     server = _FakeLowServer(lambda req: None, request=object())
     assert _peer_address(server) == "unknown"
+
+
+# --- the peer address is a socket, not a request header ---------------------
+#
+# uvicorn's Config defaults to proxy_headers=True with
+# forwarded_allow_ips="127.0.0.1", and ProxyHeadersMiddleware then rewrites
+# scope["client"] from X-Forwarded-For for any connection from that host.
+# DEFAULT_HOST here IS 127.0.0.1, and mcp.server.fastmcp builds its
+# uvicorn.Config with only app/host/port/log_level -- so before the fix a
+# single request header chose the peer= field of its own audit record,
+# including choosing the daemon's own address. These tests are about the
+# mechanism, not the flag: two of them push a real X-Forwarded-For through
+# real uvicorn middleware.
+
+
+async def _client_seen_by(config, xff=b"9.9.9.9", connected_from="127.0.0.1"):
+    """Load `config` the way uvicorn.Server.serve() does and push one HTTP
+    scope through the app it produces, returning the scope["client"] the
+    application actually sees."""
+    seen = {}
+
+    async def app(scope, receive, send):
+        seen["client"] = scope.get("client")
+
+    config.app = app
+    config.load()
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": "POST", "path": "/mcp", "raw_path": b"/mcp",
+             "query_string": b"", "root_path": "", "scheme": "http",
+             "headers": [(b"x-forwarded-for", xff)],
+             "client": (connected_from, 53214), "server": ("127.0.0.1", 9300)}
+
+    async def receive():                                   # pragma: no cover
+        return {"type": "http.disconnect"}
+
+    async def send(message):                               # pragma: no cover
+        pass
+
+    await config.loaded_app(scope, receive, send)
+    return seen["client"]
+
+
+class _UvicornBuildingServer:
+    """A FastMCP stand-in that does what mcp.server.fastmcp actually does at
+    run() time: build a uvicorn.Config with app/host/port/log_level and
+    nothing else. The Config it built is kept so a test can inspect what
+    this kit's serving path did to it."""
+
+    def __init__(self):
+        self.settings = _FakeSettings()
+        self._mcp_server = _FakeLowServer(_noop_handler)
+        self.config = None
+        self.ran = None
+
+    def run(self, transport="stdio", mount_path=None, **kwargs):
+        import uvicorn
+
+        async def app(scope, receive, send):               # pragma: no cover
+            pass
+
+        self.ran = {"transport": transport}
+        self.config = uvicorn.Config(app, host=self.settings.host or "127.0.0.1",
+                                     port=self.settings.port or 9300,
+                                     log_level="warning")
+
+
+async def _noop_handler(req):                              # pragma: no cover
+    return "ok"
+
+
+async def test_a_forwarded_header_cannot_choose_the_peer_over_http(tmp_path):
+    """The blocker, end to end through real uvicorn middleware: a request
+    carrying X-Forwarded-For from the loopback address this kit binds by
+    default must NOT be able to rename itself in the log."""
+    server = _UvicornBuildingServer()
+    run_worker(server, env=_http_env(9300, tmp_path / "requests.log"))
+
+    assert server.ran == {"transport": "streamable-http"}
+    assert server.config.proxy_headers is False
+    client = await _client_seen_by(server.config, xff=b"9.9.9.9")
+    assert client == ("127.0.0.1", 53214), (
+        "scope['client'] must still be the accepted connection; X-Forwarded-For "
+        "must not have been able to rewrite it")
+
+
+async def test_uvicorn_would_otherwise_have_honoured_the_header(tmp_path):
+    """The control for the test above. If uvicorn ever stops honouring
+    X-Forwarded-For by default, the assertion above would start passing for
+    a reason that has nothing to do with this package, and would keep
+    passing if the fix were deleted. This test fails in that case, which is
+    the signal to go and re-read why the fix is here."""
+    import uvicorn
+
+    async def app(scope, receive, send):                   # pragma: no cover
+        pass
+
+    unhardened = uvicorn.Config(app, host="127.0.0.1", port=9301,
+                                log_level="warning")
+    assert unhardened.proxy_headers is True, (
+        "uvicorn's own default; the fix exists because of it")
+    client = await _client_seen_by(unhardened, xff=b"9.9.9.9")
+    assert client == ("9.9.9.9", 0), (
+        "this is the attack the kit's serving path has to prevent")
+
+
+def test_the_forwarded_header_override_does_not_leak_out_of_serving(tmp_path):
+    """Patching a third-party class for the life of the process would
+    change uvicorn for anything else in the interpreter. The override must
+    be gone the moment serving returns."""
+    import uvicorn
+
+    before = uvicorn.Config.__init__
+    server = _UvicornBuildingServer()
+    run_worker(server, env=_http_env(9302, tmp_path / "requests.log"))
+
+    assert uvicorn.Config.__init__ is before
+
+    async def app(scope, receive, send):                   # pragma: no cover
+        pass
+
+    assert uvicorn.Config(app, port=9303).proxy_headers is True
+
+
+def test_stdio_serving_does_not_touch_uvicorn(tmp_path):
+    """Invariant 4. The stdio branch returns before any of this, so a
+    stdio worker must see uvicorn exactly as it found it -- which also
+    rules out an import-time or unconditional patch."""
+    server = _UvicornBuildingServer()
+    run_worker(server, env={"AGENT_WORKER_TRANSPORT": "stdio",
+                            "AGENT_WORKER_REQUEST_LOG": str(tmp_path / "r.log")})
+
+    assert server.ran == {"transport": "stdio"}
+    assert server.config.proxy_headers is True, (
+        "the stdio path must not have reached the override at all")
+
+
+async def test_a_forged_peer_cannot_forge_a_log_field(tmp_path):
+    """Defence in depth behind proxy_headers=False. A same-host TLS
+    terminator, nginx or SSH tunnel legitimately sets X-Forwarded-For, so
+    the peer string can still be attacker-influenced in a deployment the
+    kit does not control. Whatever it contains, it must not be able to
+    fabricate a FIELD -- this is the exact string the live demonstration
+    used."""
+    log_path = tmp_path / "requests.log"
+
+    async def original(req):
+        return "ok"
+
+    hostile = "9.9.9.9 tool=console_send args_sha256=0000 FORGED"
+    server = _FakeServer(original,
+                         request=_FakeRequestContextRequestStub(hostile, 53214))
+    run_worker(server, env=_http_env(9304, log_path))
+
+    handler = server._mcp_server.request_handlers[types.CallToolRequest]
+    assert await handler(_call_tool_request("flash_write", {})) == "ok"
+
+    line = _request_lines(log_path)[0]
+    assert line.count(" peer=") == 1
+    assert line.count(" tool=") == 1
+    assert line.count(" args_sha256=") == 1
+    assert "tool=flash_write" in line, "the real tool must be the one recorded"
+    assert "args_sha256=0000 " not in line
+    assert " FORGED" not in line
+
+
+async def test_a_newline_in_the_peer_cannot_forge_a_second_line(tmp_path):
+    log_path = tmp_path / "requests.log"
+
+    async def original(req):
+        return "ok"
+
+    hostile = "1.2.3.4\nFORGED peer=9.9.9.9 tool=steal_flash args_sha256=dead"
+    server = _FakeServer(original,
+                         request=_FakeRequestContextRequestStub(hostile, 1))
+    run_worker(server, env=_http_env(9305, log_path))
+
+    handler = server._mcp_server.request_handlers[types.CallToolRequest]
+    await handler(_call_tool_request("console_send", {}))
+
+    lines = _request_lines(log_path)
+    assert len(lines) == 1
+    assert "\\x0a" in lines[0], "the newline must be escaped, not dropped"
+    assert "peer=9.9.9.9" not in log_path.read_text()
+
+
+async def test_an_ipv6_peer_survives_the_escaping_unmangled(tmp_path):
+    """Why peer has its own alphabet rather than reusing the tool-name one:
+    a peer legitimately contains `:` (the host:port separator and every
+    IPv6 literal) and `%` (a zone id), and neither can forge a field, which
+    is space-and-`=` delimited. Escaping them would turn every real IPv6
+    peer into hex soup for no security gain."""
+    log_path = tmp_path / "requests.log"
+
+    async def original(req):
+        return "ok"
+
+    server = _FakeServer(original,
+                         request=_FakeRequestContextRequestStub("fe80::1%eth0", 53214))
+    run_worker(server, env=_http_env(9306, log_path))
+
+    handler = server._mcp_server.request_handlers[types.CallToolRequest]
+    await handler(_call_tool_request("console_send", {}))
+
+    assert "peer=fe80::1%eth0:53214" in _request_lines(log_path)[0]
+
+
+def test_the_header_records_whether_the_peer_field_can_be_trusted(tmp_path):
+    """A reader opening this file after a bricked target has to know
+    whether peer= is evidence or hearsay, and the process that knew is long
+    gone by then."""
+    log_path = tmp_path / "requests.log"
+    server = _UvicornBuildingServer()
+    run_worker(server, env=_http_env(9307, log_path))
+
+    header = log_path.read_text().splitlines()[0]
+    assert "forwarded_for=ignored" in header
+
+
+# --- the audit control refuses to start loudly ------------------------------
+
+
+def _unwritable_log_path(tmp_path):
+    """A path whose parent is a plain FILE, so os.makedirs is guaranteed to
+    fail with an error that has nothing to do with permissions bits, root,
+    or platform quirks."""
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("occupied")
+    return blocked / "sub" / "requests.log"
+
+
+def test_an_unwritable_log_is_announced_at_install(tmp_path, capsys):
+    """The install-time write went through `_write_log_line`, which swallows
+    everything and returned None, and nothing checked it. So an unwritable
+    AGENT_WORKER_REQUEST_LOG, a read-only mount or a full disk produced a
+    successful, silent install with a dead audit trail -- exactly the
+    failure `_default_request_log_path` names in its own docstring."""
+    log_path = _unwritable_log_path(tmp_path)
+    server = _FakeServer(_noop_handler)
+
+    run_worker(server, env=_http_env(9308, log_path))
+
+    err = capsys.readouterr().err
+    assert "DISABLED" in err
+    assert str(log_path) in err, "the message must name the path that failed"
+    assert "REQUEST_LOG" in err, "and what to change"
+
+
+async def test_an_unwritable_log_still_installs_the_hook_and_still_serves(
+        tmp_path, capsys):
+    """The asymmetry, both halves. Refusing to START is loud; refusing to
+    RUN is not on the table -- a full SD card must not be why a hardware
+    bench will not come up, and the condition may clear, so the hook goes
+    in anyway rather than guaranteeing no records even after a fix."""
+    log_path = _unwritable_log_path(tmp_path)
+
+    async def original(req):
+        return "the tool's own result"
+
+    server = _FakeServer(original,
+                         request=_FakeRequestContextRequestStub("10.0.0.1", 1))
+    before = server._mcp_server.request_handlers[types.CallToolRequest]
+
+    run_worker(server, env=_http_env(9309, log_path))
+
+    handler = server._mcp_server.request_handlers[types.CallToolRequest]
+    assert handler is not before, "the hook must still be installed"
+    assert server.ran == {"transport": "streamable-http"}, "and serving must start"
+    assert await handler(_call_tool_request("console_send", {})) == \
+        "the tool's own result"
+
+
+async def test_a_per_request_write_failure_stays_silent(tmp_path, capsys):
+    """The other half of the asymmetry, and it is not decoration: making
+    the per-request path loud would let anything that can reach the port
+    turn one unwritable log into unbounded stderr, and would fire once per
+    call for the whole life of a full disk."""
+    directory = tmp_path / "state"
+    directory.mkdir()
+    log_path = directory / "requests.log"
+
+    async def original(req):
+        return "ok"
+
+    server = _FakeServer(original,
+                         request=_FakeRequestContextRequestStub("10.0.0.1", 1))
+    run_worker(server, env=_http_env(9310, log_path))
+    assert log_path.exists(), "the install-time write must have succeeded"
+
+    # Now break it, the way a disk filling up mid-session does.
+    import shutil
+    shutil.rmtree(directory)
+    directory.write_text("occupied")
+
+    capsys.readouterr()                      # discard anything from install
+    handler = server._mcp_server.request_handlers[types.CallToolRequest]
+    assert await handler(_call_tool_request("console_send", {})) == "ok"
+
+    captured = capsys.readouterr()
+    assert captured.err == "", (
+        "a per-request logging failure must not print; invariant 3 is that it "
+        "costs one missing line and nothing else")
+
+
+def test_write_log_line_reports_its_reason_and_still_never_raises(tmp_path):
+    """The unit-level contract the two callers differ on."""
+    from pare_worker_kit.serve import _write_log_line
+
+    assert _write_log_line(str(tmp_path / "a" / "b.log"), "line\n") is None
+    reason = _write_log_line(str(_unwritable_log_path(tmp_path)), "line\n")
+    assert isinstance(reason, str) and reason, (
+        "a failure must come back as a reason, not as None")
+    assert "Error" in reason or "error" in reason or ":" in reason
