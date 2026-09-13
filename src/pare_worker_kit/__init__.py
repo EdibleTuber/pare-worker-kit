@@ -15,4 +15,4 @@ __all__ = ["PRODUCES_ARTIFACT", "PRODUCES_META_KEY", "PRODUCES_RESULT",
            "RISK_TIER_META_KEY", "VALID_RISK_TIERS",
            "run_worker", "resolve_bind_address", "stamp_version",
            "WorkerServeError"]
-__version__ = "0.1.2"
+__version__ = "0.2.0"
