@@ -80,6 +80,27 @@ def test_the_slug_rule_agrees_with_agent_cores():
     assert SLUG_RE.flags == ac.SLUG_RE.flags
 
 
+def test_the_descriptor_contract_agrees_with_agent_core():
+    """The field set and the two reserved argument names are stated twice --
+    once per package -- and this is what keeps the two statements the same,
+    for the reason every guard in this file gives.
+
+    Named so the CI filter (`-k agrees_with_agent_core`) collects it: the
+    cross-package job fails if a guard matching that filter is skipped or if
+    none is collected.
+
+    The field set is compared as a TUPLE, not a set: the order is the wire
+    order, and a reordering on one side is drift this guard exists to catch.
+    """
+    ac = pytest.importorskip(
+        "agent_core.workers.artifacts",
+        reason="agent_core is not installed here; the daemon-side half of "
+               "this check runs in agent_core's own suite")
+    assert ac.ARTIFACT_DESCRIPTOR_FIELDS == ARTIFACT_DESCRIPTOR_FIELDS
+    assert ac.RESERVED_SLUG_ARG == RESERVED_SLUG_ARG
+    assert ac.RESERVED_DRIVE_ID_ARG == RESERVED_DRIVE_ID_ARG
+
+
 # Task 8: worker-side containment
 import os
 
