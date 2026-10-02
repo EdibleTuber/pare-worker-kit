@@ -25,6 +25,42 @@ VALID_PRODUCES = (PRODUCES_RESULT, PRODUCES_ARTIFACT)
 build time, not a silent default -- the same choice the risk tier makes, and
 copying the mechanism without copying that choice would lose the property."""
 
+ARTIFACT_DESCRIPTOR_FIELDS = ("host", "path", "size", "sha256", "hashed_at",
+                              "media_type", "drive_id")
+"""The seven fields a `produces: artifact` tool returns, in wire order.
+
+Stated here AND in agent_core, with a guard test on each side, for the same
+reason as PRODUCES_META_KEY above: the two packages are separately installed
+and never share a Python environment, so a shared import could not guarantee
+agreement across the wire any better than two statements can. The worker
+builds exactly these fields (open_artifact, which lands after this) and the
+daemon's validate_descriptor requires exactly these; a field present on one
+side and not the other is a descriptor that validates on one machine and is
+refused on the other, with no useful error anywhere. All seven are required;
+none is optional. The eighth field of the object that gets published,
+produced_by, is added by the daemon AFTER validation and never travels.
+"""
+
+RESERVED_SLUG_ARG = "project_slug"
+"""The tool-argument name the daemon injects with the project's ArcticBase
+slug. RESERVED_DRIVE_ID_ARG is the same arrangement for the drive id the
+artifact must land on; see it below.
+
+Reserved means the daemon supplies the value: injected at the dispatch
+chokepoint, overwriting whatever the model supplied, so the model never sees
+it as an input it may choose. A worker names its tool-handler parameter after
+this value so the injection lands where the handler expects it -- which is
+why the value must be a legal Python identifier as well as wire vocabulary.
+Stated here AND in agent_core, with a guard test on each side. Changing
+either value is a wire-breaking change.
+"""
+
+RESERVED_DRIVE_ID_ARG = "expected_drive_id"
+"""The same arrangement as RESERVED_SLUG_ARG, for the drive id. The worker
+passes the injected value through to open_artifact as expect_drive_id; a
+descriptor whose drive_id differs is refused.
+"""
+
 
 _SLUG_MAX = 64
 """ArcticBase's cap. Stated as a constant so the pattern below and the tests
