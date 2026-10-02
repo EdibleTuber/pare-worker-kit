@@ -1,7 +1,9 @@
 import pytest
 
-from pare_worker_kit import (PRODUCES_ARTIFACT, PRODUCES_META_KEY,
-                             PRODUCES_RESULT, VALID_PRODUCES)
+from pare_worker_kit import (ARTIFACT_DESCRIPTOR_FIELDS, PRODUCES_ARTIFACT,
+                             PRODUCES_META_KEY, PRODUCES_RESULT,
+                             RESERVED_DRIVE_ID_ARG, RESERVED_SLUG_ARG,
+                             VALID_PRODUCES)
 
 
 def test_the_meta_key_is_stable_protocol():
@@ -16,6 +18,38 @@ def test_result_is_the_default_value():
     assert PRODUCES_RESULT == "result"
     assert PRODUCES_ARTIFACT == "artifact"
     assert VALID_PRODUCES == ("result", "artifact")
+
+
+def test_the_descriptor_field_set_is_the_wire_contract():
+    """A LOCAL pin, for the reason the slug pin below gives: the importorskip
+    guard that follows SKIPS on every routine run of this suite and on every
+    job of this package's own CI, so a change to the field set could ship
+    silently. This is the wire contract crossing a machine boundary, stated
+    independently in each package; a change to it here must fail a test in
+    THIS suite.
+
+    Pinned as a literal tuple: the order is the wire order. The
+    no-duplicates check is a relationship because seven distinct names is
+    the property, not the number itself.
+    """
+    assert ARTIFACT_DESCRIPTOR_FIELDS == ("host", "path", "size", "sha256",
+                                          "hashed_at", "media_type",
+                                          "drive_id")
+    assert len(set(ARTIFACT_DESCRIPTOR_FIELDS)) == len(
+        ARTIFACT_DESCRIPTOR_FIELDS)
+
+
+def test_the_reserved_argument_names_are_wire_literals_and_identifiers():
+    """The daemon injects these as tool arguments and a worker handler names
+    a parameter after each value, so each must be wire vocabulary AND a legal
+    Python identifier. Pinned as literals: changing one is a wire-breaking
+    change. The distinctness is pinned because a collision would mean the
+    daemon overwrites the wrong input silently."""
+    assert RESERVED_SLUG_ARG == "project_slug"
+    assert RESERVED_DRIVE_ID_ARG == "expected_drive_id"
+    assert RESERVED_SLUG_ARG.isidentifier()
+    assert RESERVED_DRIVE_ID_ARG.isidentifier()
+    assert RESERVED_SLUG_ARG != RESERVED_DRIVE_ID_ARG
 
 
 def test_it_agrees_with_agent_cores():
