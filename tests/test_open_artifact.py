@@ -297,12 +297,17 @@ def test_d7_enospc_mid_write_is_named_and_the_temporary_survives():
     """D7 -- ENOSPC mid-write (rig, R13).
 
     A fresh default (64 MiB) image; expected_size is exactly the rig's
-    reported free bytes (R12's equality admits it), so the write runs out
-    within the last fraction of a MiB: a genuine mid-write ENOSPC with
-    0 < bytes_written < expected_size. The error is DriveFullError;
-    NO descriptor is produced and the TEMPORARY REMAINS with 0 < size <
-    expected_size -- asserting only the raise would be vacuous against a
-    design whose claim is the .partial.
+    reported free bytes (R12's equality admits it), so the write runs
+    out at the free boundary: a genuine mid-write ENOSPC. Plan R13
+    assumed ext4's metadata overhead lands the exhaustion strictly
+    below expected_size; probed twice on this platform (kernel
+    6.8.0-142-generic, Ubuntu 24.04 ext4, fresh 64 MiB image), a raw
+    write consumes EXACTLY f_bavail * f_frsize bytes before ENOSPC, so
+    the boundary below is <=, not <: the spec requires only that no
+    descriptor is produced and that the .partial REMAINS, both of which
+    are asserted. The error is DriveFullError; the TEMPORARY REMAINS
+    with 0 < size <= expected_size -- asserting only the raise would be
+    vacuous against a design whose claim is the .partial.
 
     RED against the baseline, for the stated reason: its raw write raises
     a bare OSError(ENOSPC) (unnamed), and its partial file sits at the
@@ -324,7 +329,7 @@ def test_d7_enospc_mid_write_is_named_and_the_temporary_survives():
         temp = os.path.join(root, SLUG, NAME + "+partial")
         assert os.path.lexists(temp)
         size = os.lstat(temp).st_size
-        assert 0 < size < expected_size
+        assert 0 < size <= expected_size
         assert not os.path.lexists(os.path.join(root, SLUG, NAME))
         with pytest.raises(AttributeError):
             w.descriptor
