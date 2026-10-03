@@ -41,6 +41,7 @@ import re
 import shutil
 import socket
 import sys
+import threading
 import uuid
 
 import pytest
@@ -639,6 +640,54 @@ def test_d16_the_tool_supplied_facts_are_validated(tmp_path, media_type,
                    media_type=media_type,
                    expected_size=expected_size) as w:
             pass
+
+
+def test_d17_a_fifo_at_the_sentinel_is_refused_and_does_not_block(tmp_path):
+    """D17 -- a FIFO parked at the sentinel (R8, step 2).
+
+    root/.bench-store-id is a named pipe. A local attacker with write
+    access inside the root needs no privilege to mkfifo it (deleting a
+    real sentinel first, if one exists). The step-2 open must NOT block:
+    O_RDONLY on a FIFO blocks in the kernel until a writer opens the
+    other end, and nothing in the walk ever does, so a blocking open is
+    a permanent hang for the daemon -- an availability failure, and a
+    departure from R8 (a non-regular sentinel is DriveNotMountedError,
+    §5's exact message, never a hang). The fstat branch is exactly where
+    the FIFO is refused (S_ISFIFO is not S_ISREG); it is reachable only
+    if the open carries O_NONBLOCK.
+
+    The walk runs on a daemon thread with a bounded join: a blocking
+    open leaves the thread alive and this test fails in a couple of
+    seconds instead of hanging the suite.
+
+    RED against the baseline, for the stated reason: it has no sentinel
+    check at all and raises no DriveNotMountedError (a clean "did not
+    raise", as in D3).
+    """
+    root = str(tmp_path)
+    drive_id = str(uuid.uuid4())
+    _prepare(root, SLUG)  # no regular sentinel at the root
+    os.mkfifo(os.path.join(root, SENTINEL_NAME))
+    expected_msg = f"no `.bench-store-id` at {root} — is the drive mounted?"
+
+    outcome = {}
+
+    def run():
+        try:
+            with _call(root, SLUG, NAME, drive_id=drive_id) as w:
+                pass
+        except BaseException as e:  # noqa: BLE001 - the test inspects it
+            outcome["error"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(2.0)
+    assert not t.is_alive(), (
+        "the walk blocked on the FIFO sentinel: step 2's open must carry "
+        "O_NONBLOCK, and a non-regular sentinel is refused, not parked")
+    assert "error" in outcome, "the walk did not refuse the FIFO sentinel"
+    assert isinstance(outcome["error"], DriveNotMountedError)
+    assert str(outcome["error"]) == expected_msg
 
 
 # --- contract pins: green by design ---------------------------------------

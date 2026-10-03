@@ -501,14 +501,22 @@ def _sentinel_drive_id(root_fd, declared_root):
     with a newline). Every way the sentinel is not a small regular file
     with a clean value -- absent, a symlink (O_NOFOLLOW refuses it: ELOOP
     on a link to a file, ENOTDIR on a link to a directory; R8), a
-    directory, oversized, undecodable -- raises DriveNotMountedError with
-    the exact message, because the honest diagnosis for all of them is
-    "there is no real sentinel here." A mismatch against whatever a
-    redirection happens to point at would send the operator to the wrong
-    stick, which is the failure this check exists to prevent.
+    directory, a FIFO, oversized, undecodable -- raises
+    DriveNotMountedError with the exact message, because the honest
+    diagnosis for all of them is "there is no real sentinel here." A
+    mismatch against whatever a redirection happens to point at would
+    send the operator to the wrong stick, which is the failure this
+    check exists to prevent.
+
+    The open carries O_NONBLOCK: an O_RDONLY open of a FIFO parks in the
+    kernel until a writer arrives, and nothing in the walk ever does,
+    so without the flag a FIFO parked at the sentinel (no privilege
+    needed from anything with write access inside the root) would hang
+    the daemon instead of being refused by the fstat branch below.
     """
     try:
-        fd = os.open(SENTINEL_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        fd = os.open(SENTINEL_NAME,
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                      dir_fd=root_fd)
     except OSError:
         raise DriveNotMountedError(
@@ -516,7 +524,9 @@ def _sentinel_drive_id(root_fd, declared_root):
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            # A directory opens O_RDONLY on Linux; only fstat tells.
+            # A directory -- and a FIFO, which the open's O_NONBLOCK
+            # keeps from parking the walk -- opens O_RDONLY on Linux;
+            # only fstat tells.
             raise DriveNotMountedError(
                 _drive_not_mounted_message(declared_root))
         buf = bytearray()
