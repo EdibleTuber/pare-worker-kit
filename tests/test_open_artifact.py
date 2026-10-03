@@ -893,7 +893,7 @@ def test_p7_write_returns_the_count_and_rejects_non_bytes(tmp_path):
             w.write("not bytes")
 
 
-def test_p8_the_descriptor_survives_the_daemons_validator(tmp_path):
+def test_p8_the_descriptor_agrees_with_agent_cores(tmp_path):
     """P8 -- the cross-package pin (the one deliberate skip in the suite).
 
     Build a descriptor via the happy path with root R and slug S, then run
