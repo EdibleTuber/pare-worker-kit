@@ -927,6 +927,7 @@ def test_p8_the_descriptor_agrees_with_agent_cores(tmp_path):
         risk_default="low",
         artifact_root=root,
         artifact_drive_id=drive_id,
+        artifact_host="127.0.0.1",
     )
     assert ac.validate_descriptor(
         descriptor, spec=spec, tool="dump", slug=SLUG) == descriptor

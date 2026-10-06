@@ -34,4 +34,4 @@ __all__ = ["ARTIFACT_DESCRIPTOR_FIELDS", "PRODUCES_ARTIFACT",
             "RISK_TIER_META_KEY", "VALID_RISK_TIERS", "open_artifact",
             "run_worker", "resolve_bind_address", "stamp_version",
             "WorkerServeError"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"
